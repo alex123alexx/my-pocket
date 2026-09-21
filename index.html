@@ -242,8 +242,7 @@
       categories:{ income:DEFAULT_INCOME_CATS.slice(), expense:DEFAULT_EXPENSE_CATS.slice() },
       budgets:[],
       goals:[],
-      bills:[],
-      settings:{ eurRate:117 }
+      bills:[]
     };
   }
 
@@ -255,41 +254,6 @@
       }
     });
     return list;
-  }
-
-  // Everything is tracked in RSD internally. Any record still flagged EUR
-  // (from before this feature existed) gets converted once, and the original
-  // EUR figure is preserved for reference so nothing is silently lost.
-  function migrateToRSD(d, rate){
-    d.transactions.forEach(function(t){
-      if(t.currency === 'EUR'){
-        if(t.originalAmount === undefined){ t.originalAmount = t.amount; t.originalCurrency = 'EUR'; }
-        t.amount = t.amount * rate;
-        t.currency = 'RSD';
-      }
-    });
-    d.budgets.forEach(function(b){
-      if(b.currency === 'EUR'){
-        if(b.originalLimit === undefined){ b.originalLimit = b.limit; b.originalCurrency = 'EUR'; }
-        b.limit = b.limit * rate;
-        b.currency = 'RSD';
-      }
-    });
-    d.goals.forEach(function(g){
-      if(g.currency === 'EUR'){
-        if(g.originalTarget === undefined){ g.originalTarget = g.target; g.originalCurrency = 'EUR'; }
-        g.target = g.target * rate;
-        g.saved = g.saved * rate;
-        g.currency = 'RSD';
-      }
-    });
-    d.bills.forEach(function(b){
-      if(b.currency === 'EUR'){
-        if(b.originalAmount === undefined){ b.originalAmount = b.amount; b.originalCurrency = 'EUR'; }
-        b.amount = b.amount * rate;
-        b.currency = 'RSD';
-      }
-    });
   }
 
   function loadState(){
@@ -307,15 +271,11 @@
             if(Array.isArray(parsed.categories.income)) d.categories.income = parsed.categories.income;
             if(Array.isArray(parsed.categories.expense)) d.categories.expense = parsed.categories.expense;
           }
-          if(parsed.settings && typeof parsed.settings.eurRate === 'number' && parsed.settings.eurRate > 0){
-            d.settings.eurRate = parsed.settings.eurRate;
-          }
         }
       }
     }catch(e){
       console.error('Učitavanje podataka nije uspelo', e);
     }
-    migrateToRSD(d, d.settings.eurRate);
     d.categories.income = mergeMissingDefaults(d.categories.income, DEFAULT_INCOME_CATS);
     d.categories.expense = mergeMissingDefaults(d.categories.expense, DEFAULT_EXPENSE_CATS);
     return d;
@@ -334,7 +294,8 @@
   var ui = {
     tab:'pregled',
     overviewMonth: todayMonthKey(),
-    txFilter:{ type:'all', q:'' }
+    overviewCurrency:'EUR',
+    txFilter:{ type:'all', currency:'all', q:'' }
   };
   var downloadsCap; // undefined = unresolved, null = unavailable
 
@@ -383,23 +344,6 @@
     return sign + new Intl.NumberFormat('sr-RS', {minimumFractionDigits:2, maximumFractionDigits:2}).format(abs);
   }
   function fmtMoney(n, currency){ return fmtAmount(n) + ' ' + (currency === 'EUR' ? '€' : 'RSD'); }
-  function toRSD(amount, currency){ return currency === 'EUR' ? amount * state.settings.eurRate : amount; }
-  function wireConversionPreview(amountId, currencyId, previewId){
-    function update(){
-      var amtEl = document.getElementById(amountId), curEl = document.getElementById(currencyId), prev = document.getElementById(previewId);
-      if(!amtEl || !curEl || !prev) return;
-      var amt = parseFloat(amtEl.value);
-      if(curEl.value === 'EUR' && amt > 0){
-        prev.textContent = '≈ ' + fmtMoney(amt * state.settings.eurRate, 'RSD') + ' (kurs 1 € = ' + fmtAmount(state.settings.eurRate) + ' RSD)';
-        prev.classList.remove('hidden');
-      } else {
-        prev.classList.add('hidden');
-      }
-    }
-    document.getElementById(amountId).addEventListener('input', update);
-    document.getElementById(currencyId).addEventListener('change', update);
-    update();
-  }
   function esc(s){
     return String(s).replace(/[&<>"']/g, function(c){
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
@@ -436,4 +380,727 @@
   function billStatus(b){
     if(b.recurrence==='once' && b.paid) return {key:'paid', label:'Plaćeno ✓'};
     var days = daysUntil(b.dueDate);
-    if(days < 0) return {key:'overdu
+    if(days < 0) return {key:'overdue', label:'Kasni ' + Math.abs(days) + ' ' + danaWord(Math.abs(days))};
+    if(days === 0) return {key:'soon', label:'Dospeva danas'};
+    if(days <= 5) return {key:'soon', label:'Dospeva za ' + days + ' ' + danaWord(days)};
+    return {key:'upcoming', label:'Za ' + days + ' ' + danaWord(days)};
+  }
+
+  // ---------- rendering ----------
+  function render(){
+    var active = document.activeElement;
+    var activeId = active && active.id;
+    var selStart = active && typeof active.selectionStart === 'number' ? active.selectionStart : null;
+    var selEnd = active && typeof active.selectionEnd === 'number' ? active.selectionEnd : null;
+
+    renderTabs();
+    var content = document.getElementById('tabContent');
+    if(ui.tab === 'pregled') content.innerHTML = renderPregled();
+    else if(ui.tab === 'transakcije') content.innerHTML = renderTransakcije();
+    else if(ui.tab === 'budzet') content.innerHTML = renderBudzet();
+    else if(ui.tab === 'ciljevi') content.innerHTML = renderCiljevi();
+    else if(ui.tab === 'racuni') content.innerHTML = renderRacuni();
+    else if(ui.tab === 'podesavanja') content.innerHTML = renderPodesavanja();
+
+    if(activeId){
+      var el = document.getElementById(activeId);
+      if(el){
+        el.focus();
+        if(selStart !== null && el.setSelectionRange){
+          try{ el.setSelectionRange(selStart, selEnd); }catch(e){}
+        }
+      }
+    }
+  }
+
+  function renderTabs(){
+    var el = document.getElementById('tabbar');
+    el.innerHTML = TABS.map(function(t){
+      return '<button class="tab-btn' + (ui.tab===t.id?' active':'') + '" data-action="setTab" data-tab="'+t.id+'">'+t.label+'</button>';
+    }).join('');
+  }
+
+  function renderTxRow(t, compact){
+    var sign = t.type==='income' ? '+' : '−';
+    var cls = t.type==='income' ? 'income' : 'expense';
+    var actions = compact ? '' : (
+      '<div class="row-actions">' +
+        '<button class="icon-btn" data-action="editTx" data-id="'+t.id+'" title="Izmeni">✎</button>' +
+        '<button class="icon-btn" data-action="deleteTx" data-id="'+t.id+'" title="Obriši">✕</button>' +
+      '</div>'
+    );
+    return (
+      '<div class="row">' +
+        '<div class="row-main">' +
+          '<div class="row-title">'+esc(t.category)+'</div>' +
+          '<div class="row-sub">'+fmtDateDisplay(t.date)+(t.note ? ' · '+esc(t.note) : '')+'</div>' +
+        '</div>' +
+        '<div class="row-end">' +
+          '<div class="amt '+cls+'">'+sign+' '+fmtMoney(t.amount,t.currency)+'</div>' +
+          actions +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function renderBillRow(b, compact){
+    var st = billStatus(b);
+    var actions = compact ? '' : (
+      '<div class="row-actions">' +
+        (st.key!=='paid' ? '<button class="icon-btn" data-action="payBill" data-id="'+b.id+'" title="Označi kao plaćeno">✓</button>' : '') +
+        '<button class="icon-btn" data-action="deleteBill" data-id="'+b.id+'" title="Obriši">✕</button>' +
+      '</div>'
+    );
+    return (
+      '<div class="row">' +
+        '<div class="row-main">' +
+          '<div class="row-title">'+esc(b.name)+'</div>' +
+          '<div class="row-sub">Dospeva: '+fmtDateDisplay(b.dueDate)+' · '+fmtMoney(b.amount,b.currency)+'</div>' +
+        '</div>' +
+        '<div class="row-end">' +
+          '<span class="badge '+st.key+'">'+st.label+'</span>' +
+          actions +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function renderPregled(){
+    var eurBal = allTimeBalance('EUR');
+    var rsdBal = allTimeBalance('RSD');
+    var mk = ui.overviewMonth;
+    var cur = ui.overviewCurrency;
+    var totals = monthTotals(mk, cur);
+    var cats = categoryBreakdown(mk, cur);
+    var maxCat = cats.length ? cats[0][1] : 0;
+    var recent = state.transactions.slice().sort(function(a,b){
+      return b.date.localeCompare(a.date) || b.id.localeCompare(a.id);
+    }).slice(0,5);
+    var upcomingBills = state.bills.filter(function(b){ return !(b.recurrence==='once' && b.paid); })
+      .slice().sort(function(a,b){ return a.dueDate.localeCompare(b.dueDate); }).slice(0,3);
+
+    var catsHtml = cats.length ? cats.map(function(entry){
+      var c = entry[0], amt = entry[1];
+      var pct = maxCat ? Math.round(amt/maxCat*100) : 0;
+      return (
+        '<div class="bar-row">' +
+          '<div class="bar-row-top"><span>'+esc(c)+'</span><span>'+fmtMoney(amt,cur)+'</span></div>' +
+          '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%"></div></div>' +
+        '</div>'
+      );
+    }).join('') : '<div class="empty">Nema rashoda u ovom mesecu.</div>';
+
+    var recentHtml = recent.length
+      ? recent.map(function(t){ return renderTxRow(t, true); }).join('') +
+        '<button class="btn btn-secondary btn-block btn-sm" style="margin-top:.6rem" data-action="setTab" data-tab="transakcije">Vidi sve transakcije</button>'
+      : '<div class="empty">Još nema unetih transakcija. Dodaj prvu pomoću dugmeta „+“.</div>';
+
+    var billsHtml = upcomingBills.length
+      ? upcomingBills.map(function(b){ return renderBillRow(b, true); }).join('') +
+        '<button class="btn btn-secondary btn-block btn-sm" style="margin-top:.6rem" data-action="setTab" data-tab="racuni">Vidi sve račune</button>'
+      : '<div class="empty">Nema dodatih računa.</div>';
+
+    return (
+      '<div class="pocket-row">' +
+        '<div class="pocket"><div class="pocket-label">Stanje u evrima</div><div class="pocket-amount'+(eurBal<0?' negative':'')+'">'+fmtMoney(eurBal,'EUR')+'</div></div>' +
+        '<div class="pocket"><div class="pocket-label">Stanje u dinarima</div><div class="pocket-amount'+(rsdBal<0?' negative':'')+'">'+fmtMoney(rsdBal,'RSD')+'</div></div>' +
+      '</div>' +
+      '<div class="month-nav">' +
+        '<button data-action="monthPrev" title="Prethodni mesec">‹</button>' +
+        '<span class="label">'+monthLabel(mk)+'</span>' +
+        '<button data-action="monthNext" title="Sledeći mesec">›</button>' +
+      '</div>' +
+      '<div class="cur-toggle">' +
+        '<button class="'+(cur==='EUR'?'active':'')+'" data-action="setOverviewCurrency" data-cur="EUR">EUR</button>' +
+        '<button class="'+(cur==='RSD'?'active':'')+'" data-action="setOverviewCurrency" data-cur="RSD">RSD</button>' +
+      '</div>' +
+      '<div class="stat-row">' +
+        '<div class="stat"><div class="k">Prihodi</div><div class="v amt income">'+fmtMoney(totals.income,cur)+'</div></div>' +
+        '<div class="stat"><div class="k">Rashodi</div><div class="v amt expense">'+fmtMoney(totals.expense,cur)+'</div></div>' +
+        '<div class="stat"><div class="k">Razlika</div><div class="v amt '+(totals.net<0?'expense':'income')+'">'+fmtMoney(totals.net,cur)+'</div></div>' +
+      '</div>' +
+      '<div class="section-title">Rashodi po kategorijama</div>' +
+      '<div class="card">'+catsHtml+'</div>' +
+      '<div class="section-title">Poslednje transakcije</div>' +
+      '<div class="card">'+recentHtml+'</div>' +
+      '<div class="section-title">Predstojeći računi</div>' +
+      '<div class="card">'+billsHtml+'</div>'
+    );
+  }
+
+  function renderTransakcije(){
+    var f = ui.txFilter;
+    var list = state.transactions.slice();
+    if(f.type !== 'all') list = list.filter(function(t){ return t.type===f.type; });
+    if(f.currency !== 'all') list = list.filter(function(t){ return t.currency===f.currency; });
+    if(f.q){
+      var q = f.q.toLowerCase();
+      list = list.filter(function(t){
+        return t.category.toLowerCase().indexOf(q)>-1 || (t.note||'').toLowerCase().indexOf(q)>-1;
+      });
+    }
+    list.sort(function(a,b){ return b.date.localeCompare(a.date) || b.id.localeCompare(a.id); });
+
+    var groups = [], curKey = null, curGroup = null;
+    list.forEach(function(t){
+      var mk = monthKeyOf(t.date);
+      if(mk !== curKey){ curKey = mk; curGroup = {key:mk, items:[]}; groups.push(curGroup); }
+      curGroup.items.push(t);
+    });
+
+    var filtersHtml =
+      '<div class="filters">' +
+        '<select data-action="filterType">' +
+          '<option value="all"'+(f.type==='all'?' selected':'')+'>Sve</option>' +
+          '<option value="income"'+(f.type==='income'?' selected':'')+'>Prihodi</option>' +
+          '<option value="expense"'+(f.type==='expense'?' selected':'')+'>Rashodi</option>' +
+        '</select>' +
+        '<select data-action="filterCurrency">' +
+          '<option value="all"'+(f.currency==='all'?' selected':'')+'>EUR i RSD</option>' +
+          '<option value="EUR"'+(f.currency==='EUR'?' selected':'')+'>EUR</option>' +
+          '<option value="RSD"'+(f.currency==='RSD'?' selected':'')+'>RSD</option>' +
+        '</select>' +
+        '<input type="text" id="txSearchInput" placeholder="Pretraga..." value="'+esc(f.q)+'" data-action="filterSearch">' +
+      '</div>';
+
+    var listHtml = groups.length ? groups.map(function(g){
+      return '<div class="section-title">'+monthLabel(g.key)+'</div><div class="card">' +
+        g.items.map(function(t){ return renderTxRow(t, false); }).join('') + '</div>';
+    }).join('') : '<div class="empty">Nema transakcija koje odgovaraju pretrazi.</div>';
+
+    return filtersHtml + listHtml;
+  }
+
+  function renderBudzet(){
+    var mk = todayMonthKey();
+    var body;
+    if(state.budgets.length){
+      body = state.budgets.map(function(b){
+        var spent = budgetSpent(b.category, b.currency, mk);
+        var pct = b.limit > 0 ? Math.round(spent/b.limit*100) : 0;
+        var barPct = Math.min(100, pct);
+        var cls = pct > 100 ? 'over' : (pct >= 80 ? 'warn' : '');
+        var remaining = b.limit - spent;
+        var remText = remaining >= 0
+          ? ' · preostalo ' + fmtMoney(remaining, b.currency)
+          : ' · prekoračeno ' + fmtMoney(Math.abs(remaining), b.currency);
+        return (
+          '<div class="card">' +
+            '<div style="display:flex;justify-content:space-between;margin-bottom:.3rem;">' +
+              '<strong>'+esc(b.category)+' · '+b.currency+'</strong>' +
+              '<button class="icon-btn" data-action="deleteBudget" data-id="'+b.id+'" title="Obriši">✕</button>' +
+            '</div>' +
+            '<div class="progress-track"><div class="progress-fill '+cls+'" style="width:'+barPct+'%"></div></div>' +
+            '<div class="row-sub" style="margin-top:.35rem">'+fmtMoney(spent,b.currency)+' od '+fmtMoney(b.limit,b.currency)+remText+'</div>' +
+          '</div>'
+        );
+      }).join('');
+    } else {
+      body = '<div class="empty">Još nema postavljenih budžeta.</div>';
+    }
+    return (
+      '<div class="section-title" style="margin-top:0">Budžeti za '+monthLabel(mk)+'</div>' +
+      '<button class="btn btn-block" data-action="openBudgetForm">+ Dodaj budžet</button>' +
+      '<div style="margin-top:.9rem">'+body+'</div>'
+    );
+  }
+
+  function renderCiljevi(){
+    var body;
+    if(state.goals.length){
+      body = state.goals.map(function(g){
+        var pct = g.target > 0 ? Math.min(100, Math.round(g.saved/g.target*100)) : 0;
+        var remaining = Math.max(0, g.target - g.saved);
+        var deadlineStr = '';
+        if(g.deadline){
+          var d = daysUntil(g.deadline);
+          deadlineStr = d >= 0 ? ' · rok za ' + d + ' ' + danaWord(d) : ' · rok istekao pre ' + Math.abs(d) + ' ' + danaWord(Math.abs(d));
+        }
+        var progressNote = remaining > 0 ? ' · još ' + fmtMoney(remaining, g.currency) : ' · cilj ostvaren 🎉';
+        return (
+          '<div class="card">' +
+            '<div style="display:flex;justify-content:space-between;margin-bottom:.3rem;">' +
+              '<strong>'+esc(g.name)+'</strong>' +
+              '<button class="icon-btn" data-action="deleteGoal" data-id="'+g.id+'" title="Obriši">✕</button>' +
+            '</div>' +
+            '<div class="progress-track"><div class="progress-fill" style="width:'+pct+'%"></div></div>' +
+            '<div class="row-sub" style="margin-top:.35rem">'+fmtMoney(g.saved,g.currency)+' od '+fmtMoney(g.target,g.currency)+' ('+pct+'%)'+progressNote+deadlineStr+'</div>' +
+            '<div style="display:flex;gap:.5rem;margin-top:.6rem;">' +
+              '<button class="btn btn-sm" data-action="openGoalDeposit" data-id="'+g.id+'">Uplati</button>' +
+              '<button class="btn btn-secondary btn-sm" data-action="openGoalWithdraw" data-id="'+g.id+'">Podigni</button>' +
+            '</div>' +
+          '</div>'
+        );
+      }).join('');
+    } else {
+      body = '<div class="empty">Još nema ciljeva štednje. Napravi prvi!</div>';
+    }
+    return '<button class="btn btn-block" data-action="openGoalForm">+ Novi cilj</button><div style="margin-top:.9rem">'+body+'</div>';
+  }
+
+  function renderRacuni(){
+    var unpaid = state.bills.filter(function(b){ return !(b.recurrence==='once' && b.paid); })
+      .sort(function(a,b){ return a.dueDate.localeCompare(b.dueDate); });
+    var paid = state.bills.filter(function(b){ return b.recurrence==='once' && b.paid; })
+      .sort(function(a,b){ return (b.lastPaidDate||'').localeCompare(a.lastPaidDate||''); });
+    var all = unpaid.concat(paid);
+    var body = all.length ? all.map(function(b){ return renderBillRow(b, false); }).join('') : '<div class="empty">Još nema dodatih računa.</div>';
+    return '<button class="btn btn-block" data-action="openBillForm">+ Novi račun</button><div class="card" style="margin-top:.9rem">'+body+'</div>';
+  }
+
+  function renderPodesavanja(){
+    var customExpense = state.categories.expense.filter(function(c){ return DEFAULT_EXPENSE_CATS.indexOf(c) === -1; });
+    var customIncome = state.categories.income.filter(function(c){ return DEFAULT_INCOME_CATS.indexOf(c) === -1; });
+    var expChips = customExpense.length
+      ? customExpense.map(function(c){ return '<span class="chip">'+esc(c)+' <button data-action="deleteCategory" data-type="expense" data-cat="'+esc(c)+'">✕</button></span>'; }).join('')
+      : '<span class="row-sub">Nema dodatih kategorija.</span>';
+    var incChips = customIncome.length
+      ? customIncome.map(function(c){ return '<span class="chip">'+esc(c)+' <button data-action="deleteCategory" data-type="income" data-cat="'+esc(c)+'">✕</button></span>'; }).join('')
+      : '<span class="row-sub">Nema dodatih kategorija.</span>';
+
+    return (
+      '<div class="section-title" style="margin-top:0">Podaci</div>' +
+      '<div class="card">' +
+        '<div class="row-sub" style="margin-bottom:.6rem">Ukupno transakcija: '+state.transactions.length+'</div>' +
+        '<button class="btn btn-block" style="margin-bottom:.5rem" data-action="exportCsv">Izvezi transakcije (CSV)</button>' +
+        '<button class="btn btn-secondary btn-block" style="margin-bottom:.5rem" data-action="exportJson">Izvezi rezervnu kopiju (JSON)</button>' +
+        '<label class="btn btn-secondary btn-block" style="text-align:center;display:block;cursor:pointer;">' +
+          'Uvezi rezervnu kopiju' +
+          '<input type="file" accept="application/json" id="importFileInput" style="display:none">' +
+        '</label>' +
+      '</div>' +
+      '<div class="section-title">Kategorije</div>' +
+      '<div class="card">' +
+        '<div class="row-sub">Rashodi</div><div class="chips">'+expChips+'</div>' +
+        '<div class="row-sub" style="margin-top:.7rem">Prihodi</div><div class="chips">'+incChips+'</div>' +
+      '</div>' +
+      '<div class="section-title">Opasna zona</div>' +
+      '<div class="card"><button class="btn btn-danger btn-block" data-action="resetAll">Obriši sve podatke</button></div>' +
+      '<div class="row-sub" style="margin-top:1rem;text-align:center;">Svi podaci se čuvaju lokalno, u ovom browseru na ovom uređaju — ne prebacuju se automatski na druge uređaje. Koristi izvoz/uvoz da napraviš rezervnu kopiju ili preneseš podatke.</div>'
+    );
+  }
+
+  // ---------- modal ----------
+  function openModal(title, bodyHtml){
+    document.getElementById('modalTitle').textContent = title;
+    document.getElementById('modalBody').innerHTML = bodyHtml;
+    document.getElementById('modalOverlay').classList.remove('hidden');
+  }
+  function closeModal(){
+    document.getElementById('modalOverlay').classList.add('hidden');
+    document.getElementById('modalBody').innerHTML = '';
+  }
+  function confirmAndDo(message, onConfirm){
+    openModal('Potvrda',
+      '<p style="margin-top:0">'+esc(message)+'</p>' +
+      '<div style="display:flex;gap:.6rem;margin-top:1rem;">' +
+        '<button class="btn btn-secondary" style="flex:1" data-action="cancelConfirm">Otkaži</button>' +
+        '<button class="btn btn-danger" style="flex:1" id="confirmYesBtn">Da</button>' +
+      '</div>'
+    );
+    document.getElementById('confirmYesBtn').addEventListener('click', function(){
+      closeModal();
+      onConfirm();
+    });
+  }
+
+  // ---------- forms ----------
+  function openTxForm(existing){
+    var type = existing ? existing.type : 'expense';
+    var currency = existing ? existing.currency : 'EUR';
+    var html =
+      '<input type="hidden" id="txId" value="'+(existing?existing.id:'')+'">' +
+      '<div class="form-group"><label>Tip</label><div class="seg" id="txTypeSeg">' +
+        '<button type="button" class="'+(type==='income'?'active income':'')+'" data-val="income">Prihod</button>' +
+        '<button type="button" class="'+(type==='expense'?'active expense':'')+'" data-val="expense">Rashod</button>' +
+      '</div></div>' +
+      '<div class="form-group"><label>Iznos</label><input type="number" id="txAmount" step="0.01" min="0.01" value="'+(existing?existing.amount:'')+'"></div>' +
+      '<div class="form-group"><label>Valuta</label><select id="txCurrency">' +
+        '<option value="EUR"'+(currency==='EUR'?' selected':'')+'>EUR</option>' +
+        '<option value="RSD"'+(currency==='RSD'?' selected':'')+'>RSD</option>' +
+      '</select></div>' +
+      '<div class="form-group"><label>Kategorija</label><select id="txCategory"></select></div>' +
+      '<div class="form-group hidden" id="newCatGroup"><label>Naziv nove kategorije</label><input type="text" id="newCatInput" placeholder="npr. Kućni ljubimci"></div>' +
+      '<div class="form-group"><label>Datum</label><input type="date" id="txDate" value="'+(existing?existing.date:todayISO())+'"></div>' +
+      '<div class="form-group"><label>Napomena (opciono)</label><input type="text" id="txNote" value="'+(existing?esc(existing.note||''):'')+'"></div>' +
+      '<button class="btn btn-block" id="txSaveBtn">'+(existing?'Sačuvaj izmene':'Dodaj transakciju')+'</button>';
+
+    openModal(existing ? 'Izmeni transakciju' : 'Nova transakcija', html);
+
+    var curType = type;
+    function fillCategories(){
+      var sel = document.getElementById('txCategory');
+      var list = state.categories[curType].slice();
+      if(existing && curType === existing.type && list.indexOf(existing.category) === -1){
+        list.unshift(existing.category);
+      }
+      sel.innerHTML = list.map(function(c){ return '<option value="'+esc(c)+'">'+esc(c)+'</option>'; }).join('') +
+        '<option value="__add__">+ Nova kategorija...</option>';
+      if(existing && curType === existing.type) sel.value = existing.category;
+    }
+    fillCategories();
+
+    var segBtns = document.querySelectorAll('#txTypeSeg button');
+    segBtns.forEach(function(b){
+      b.addEventListener('click', function(){
+        curType = b.dataset.val;
+        segBtns.forEach(function(x){ x.classList.remove('active','income','expense'); });
+        b.classList.add('active', curType);
+        fillCategories();
+      });
+    });
+
+    document.getElementById('txCategory').addEventListener('change', function(e){
+      document.getElementById('newCatGroup').classList.toggle('hidden', e.target.value !== '__add__');
+    });
+
+    document.getElementById('txSaveBtn').addEventListener('click', function(){
+      var amount = parseFloat(document.getElementById('txAmount').value);
+      if(!amount || amount <= 0){ toast('Unesi ispravan iznos.'); return; }
+      var currencyVal = document.getElementById('txCurrency').value;
+      var category = document.getElementById('txCategory').value;
+      var date = document.getElementById('txDate').value || todayISO();
+      var note = document.getElementById('txNote').value.trim();
+      if(category === '__add__'){
+        var newCat = document.getElementById('newCatInput').value.trim();
+        if(!newCat){ toast('Unesi naziv nove kategorije.'); return; }
+        category = newCat;
+        if(state.categories[curType].indexOf(category) === -1) state.categories[curType].push(category);
+      }
+      var id = document.getElementById('txId').value;
+      if(id){
+        var tx = state.transactions.find(function(t){ return t.id===id; });
+        Object.assign(tx, {type:curType, amount:amount, currency:currencyVal, category:category, date:date, note:note});
+      } else {
+        state.transactions.push({id:genId(), type:curType, amount:amount, currency:currencyVal, category:category, date:date, note:note});
+      }
+      saveState();
+      closeModal();
+      render();
+      toast(id ? 'Transakcija ažurirana.' : 'Transakcija dodata.');
+    });
+  }
+
+  function openBudgetForm(){
+    var html =
+      '<div class="form-group"><label>Kategorija</label><select id="bgCategory">' +
+        state.categories.expense.map(function(c){ return '<option value="'+esc(c)+'">'+esc(c)+'</option>'; }).join('') +
+      '</select></div>' +
+      '<div class="form-group"><label>Valuta</label><select id="bgCurrency"><option value="EUR">EUR</option><option value="RSD">RSD</option></select></div>' +
+      '<div class="form-group"><label>Mesečni limit</label><input type="number" id="bgLimit" step="0.01" min="0.01"></div>' +
+      '<button class="btn btn-block" id="bgSaveBtn">Sačuvaj budžet</button>';
+    openModal('Novi budžet', html);
+    document.getElementById('bgSaveBtn').addEventListener('click', function(){
+      var category = document.getElementById('bgCategory').value;
+      var currency = document.getElementById('bgCurrency').value;
+      var limit = parseFloat(document.getElementById('bgLimit').value);
+      if(!limit || limit <= 0){ toast('Unesi ispravan limit.'); return; }
+      var existing = state.budgets.find(function(b){ return b.category===category && b.currency===currency; });
+      if(existing) existing.limit = limit;
+      else state.budgets.push({id:genId(), category:category, currency:currency, limit:limit});
+      saveState(); closeModal(); render();
+      toast('Budžet sačuvan.');
+    });
+  }
+
+  function openGoalForm(){
+    var html =
+      '<div class="form-group"><label>Naziv cilja</label><input type="text" id="glName" placeholder="npr. Letovanje"></div>' +
+      '<div class="form-group"><label>Ciljani iznos</label><input type="number" id="glTarget" step="0.01" min="0.01"></div>' +
+      '<div class="form-group"><label>Valuta</label><select id="glCurrency"><option value="EUR">EUR</option><option value="RSD">RSD</option></select></div>' +
+      '<div class="form-group"><label><input type="checkbox" id="glNoDeadline"> Bez roka</label></div>' +
+      '<div class="form-group" id="glDeadlineGroup"><label>Rok</label><input type="date" id="glDeadline"></div>' +
+      '<button class="btn btn-block" id="glSaveBtn">Sačuvaj cilj</button>';
+    openModal('Novi cilj štednje', html);
+    document.getElementById('glNoDeadline').addEventListener('change', function(e){
+      document.getElementById('glDeadlineGroup').classList.toggle('hidden', e.target.checked);
+    });
+    document.getElementById('glSaveBtn').addEventListener('click', function(){
+      var name = document.getElementById('glName').value.trim();
+      var target = parseFloat(document.getElementById('glTarget').value);
+      var currency = document.getElementById('glCurrency').value;
+      var noDeadline = document.getElementById('glNoDeadline').checked;
+      var deadline = noDeadline ? null : (document.getElementById('glDeadline').value || null);
+      if(!name){ toast('Unesi naziv cilja.'); return; }
+      if(!target || target <= 0){ toast('Unesi ispravan iznos.'); return; }
+      state.goals.push({id:genId(), name:name, target:target, currency:currency, saved:0, deadline:deadline, createdAt:todayISO()});
+      saveState(); closeModal(); render();
+      toast('Cilj dodat.');
+    });
+  }
+
+  function openGoalMoneyForm(goalId, mode){
+    var goal = state.goals.find(function(g){ return g.id===goalId; });
+    if(!goal) return;
+    var label = mode === 'deposit' ? 'Uplata u cilj' : 'Podizanje sa cilja';
+    var html =
+      '<p style="margin-top:0" class="row-sub">'+esc(goal.name)+' — trenutno '+fmtMoney(goal.saved,goal.currency)+'</p>' +
+      '<div class="form-group"><label>Iznos ('+goal.currency+')</label><input type="number" id="gmAmount" step="0.01" min="0.01"></div>' +
+      '<button class="btn btn-block" id="gmSaveBtn">'+(mode==='deposit'?'Uplati':'Podigni')+'</button>';
+    openModal(label, html);
+    document.getElementById('gmSaveBtn').addEventListener('click', function(){
+      var amount = parseFloat(document.getElementById('gmAmount').value);
+      if(!amount || amount <= 0){ toast('Unesi ispravan iznos.'); return; }
+      if(mode === 'deposit'){
+        goal.saved += amount;
+        state.transactions.push({id:genId(), type:'expense', amount:amount, currency:goal.currency, category:'💰 Štednja', date:todayISO(), note:'Uplata za cilj: '+goal.name, meta:{goalId:goal.id}});
+        toast('Uplata dodata.');
+      } else {
+        var withdrawAmt = Math.min(amount, goal.saved);
+        goal.saved -= withdrawAmt;
+        state.transactions.push({id:genId(), type:'income', amount:withdrawAmt, currency:goal.currency, category:'💰 Štednja', date:todayISO(), note:'Podizanje sa cilja: '+goal.name, meta:{goalId:goal.id}});
+        toast('Sredstva podignuta.');
+      }
+      saveState(); closeModal(); render();
+    });
+  }
+
+  function openBillForm(){
+    var html =
+      '<div class="form-group"><label>Naziv računa</label><input type="text" id="blName" placeholder="npr. Struja"></div>' +
+      '<div class="form-group"><label>Iznos</label><input type="number" id="blAmount" step="0.01" min="0.01"></div>' +
+      '<div class="form-group"><label>Valuta</label><select id="blCurrency"><option value="EUR">EUR</option><option value="RSD" selected>RSD</option></select></div>' +
+      '<div class="form-group"><label>Datum dospeća</label><input type="date" id="blDueDate" value="'+todayISO()+'"></div>' +
+      '<div class="form-group"><label>Ponavljanje</label><select id="blRecurrence"><option value="once">Jednokratno</option><option value="monthly">Mesečno</option></select></div>' +
+      '<button class="btn btn-block" id="blSaveBtn">Sačuvaj račun</button>';
+    openModal('Novi račun', html);
+    document.getElementById('blSaveBtn').addEventListener('click', function(){
+      var name = document.getElementById('blName').value.trim();
+      var amount = parseFloat(document.getElementById('blAmount').value);
+      var currency = document.getElementById('blCurrency').value;
+      var dueDate = document.getElementById('blDueDate').value;
+      var recurrence = document.getElementById('blRecurrence').value;
+      if(!name){ toast('Unesi naziv računa.'); return; }
+      if(!amount || amount <= 0){ toast('Unesi ispravan iznos.'); return; }
+      if(!dueDate){ toast('Izaberi datum dospeća.'); return; }
+      state.bills.push({id:genId(), name:name, amount:amount, currency:currency, dueDate:dueDate, recurrence:recurrence, paid:false, lastPaidDate:null});
+      saveState(); closeModal(); render();
+      toast('Račun dodat.');
+    });
+  }
+
+  function markBillPaid(billId){
+    var bill = state.bills.find(function(b){ return b.id===billId; });
+    if(!bill) return;
+    state.transactions.push({id:genId(), type:'expense', amount:bill.amount, currency:bill.currency, category:'🧾 Računi', date:todayISO(), note:'Plaćeno: '+bill.name, meta:{billId:bill.id}});
+    if(bill.recurrence === 'monthly'){
+      bill.dueDate = addMonthsClamped(bill.dueDate, 1);
+      bill.paid = false;
+      bill.lastPaidDate = todayISO();
+    } else {
+      bill.paid = true;
+      bill.lastPaidDate = todayISO();
+    }
+    saveState(); render();
+    toast('Račun označen kao plaćen.');
+  }
+
+  // ---------- export / import ----------
+  async function getDownloads(){
+    if(downloadsCap !== undefined) return downloadsCap;
+    try{
+      if(window.claude && typeof window.claude.use === 'function'){
+        downloadsCap = await window.claude.use('downloads');
+      } else {
+        downloadsCap = null;
+      }
+    }catch(e){
+      downloadsCap = null;
+    }
+    return downloadsCap;
+  }
+  function handleDownloadError(e){
+    var code = e && e.code;
+    if(code === 'declined') toast('Čuvanje otkazano.');
+    else if(code === 'rate_limited') toast('Sačekaj trenutak i pokušaj ponovo.');
+    else toast('Izvoz trenutno nije moguć.');
+  }
+  function browserDownload(filename, data, mime){
+    try{
+      var blob = new Blob([data], {type: mime || 'text/plain;charset=utf-8'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+      return true;
+    }catch(e){
+      return false;
+    }
+  }
+  async function saveFile(filename, data, mime){
+    var dl = await getDownloads();
+    if(dl){
+      try{
+        await dl.save({filename:filename, data:data});
+        return true;
+      }catch(e){
+        handleDownloadError(e);
+        return false;
+      }
+    }
+    var ok = browserDownload(filename, data, mime);
+    if(!ok) toast('Izvoz trenutno nije moguć u ovom prikazu.');
+    return ok;
+  }
+  function csvEscape(v){
+    var s = String(v);
+    if(/[",\r\n]/.test(s)) return '"'+s.replace(/"/g,'""')+'"';
+    return s;
+  }
+  async function exportCSV(){
+    if(state.transactions.length === 0){ toast('Nema transakcija za izvoz.'); return; }
+    var rows = [['Datum','Tip','Kategorija','Valuta','Iznos','Napomena']];
+    state.transactions.slice().sort(function(a,b){ return a.date.localeCompare(b.date); }).forEach(function(t){
+      rows.push([t.date, t.type==='income'?'Prihod':'Rashod', t.category, t.currency, t.amount.toFixed(2), t.note||'']);
+    });
+    var csv = rows.map(function(r){ return r.map(csvEscape).join(','); }).join('\r\n');
+    var ok = await saveFile('dzep-transakcije-'+todayISO()+'.csv', csv, 'text/csv;charset=utf-8');
+    if(ok) toast('CSV fajl je izvezen.');
+  }
+  async function exportJSON(){
+    var data = JSON.stringify(state, null, 2);
+    var ok = await saveFile('dzep-backup-'+todayISO()+'.json', data, 'application/json;charset=utf-8');
+    if(ok) toast('Rezervna kopija je izvezena.');
+  }
+  function handleImportFile(file){
+    var reader = new FileReader();
+    reader.onload = function(){
+      try{
+        var parsed = JSON.parse(reader.result);
+        if(!parsed || !Array.isArray(parsed.transactions)) throw new Error('bad shape');
+        confirmAndDo('Ovo će zameniti sve trenutne podatke uvezenom rezervnom kopijom. Da li si siguran/na?', function(){
+          var d = defaultState();
+          if(Array.isArray(parsed.transactions)) d.transactions = parsed.transactions;
+          if(Array.isArray(parsed.budgets)) d.budgets = parsed.budgets;
+          if(Array.isArray(parsed.goals)) d.goals = parsed.goals;
+          if(Array.isArray(parsed.bills)) d.bills = parsed.bills;
+          if(parsed.categories){
+            if(Array.isArray(parsed.categories.income)) d.categories.income = parsed.categories.income;
+            if(Array.isArray(parsed.categories.expense)) d.categories.expense = parsed.categories.expense;
+          }
+          state = d;
+          saveState(); render();
+          toast('Podaci su uvezeni.');
+        });
+      }catch(e){
+        toast('Fajl nije validna rezervna kopija.');
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // ---------- toast ----------
+  var toastTimer = null;
+  function toast(msg){
+    var el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ el.classList.remove('show'); }, 2600);
+  }
+
+  // ---------- event delegation ----------
+  function onRootClick(e){
+    var btn = e.target.closest('[data-action]');
+    if(!btn) return;
+    var action = btn.dataset.action;
+    if(action === 'setTab'){ ui.tab = btn.dataset.tab; render(); }
+    else if(action === 'monthPrev'){ ui.overviewMonth = shiftMonthKey(ui.overviewMonth,-1); render(); }
+    else if(action === 'monthNext'){ ui.overviewMonth = shiftMonthKey(ui.overviewMonth,1); render(); }
+    else if(action === 'setOverviewCurrency'){ ui.overviewCurrency = btn.dataset.cur; render(); }
+    else if(action === 'editTx'){ openTxForm(state.transactions.find(function(t){ return t.id===btn.dataset.id; })); }
+    else if(action === 'deleteTx'){
+      confirmAndDo('Obrisati ovu transakciju?', function(){
+        state.transactions = state.transactions.filter(function(t){ return t.id!==btn.dataset.id; });
+        saveState(); render(); toast('Transakcija obrisana.');
+      });
+    }
+    else if(action === 'openBudgetForm'){ openBudgetForm(); }
+    else if(action === 'deleteBudget'){
+      confirmAndDo('Obrisati ovaj budžet?', function(){
+        state.budgets = state.budgets.filter(function(b){ return b.id!==btn.dataset.id; });
+        saveState(); render(); toast('Budžet obrisan.');
+      });
+    }
+    else if(action === 'openGoalForm'){ openGoalForm(); }
+    else if(action === 'deleteGoal'){
+      confirmAndDo('Obrisati ovaj cilj?', function(){
+        state.goals = state.goals.filter(function(g){ return g.id!==btn.dataset.id; });
+        saveState(); render(); toast('Cilj obrisan.');
+      });
+    }
+    else if(action === 'openGoalDeposit'){ openGoalMoneyForm(btn.dataset.id, 'deposit'); }
+    else if(action === 'openGoalWithdraw'){ openGoalMoneyForm(btn.dataset.id, 'withdraw'); }
+    else if(action === 'openBillForm'){ openBillForm(); }
+    else if(action === 'payBill'){
+      confirmAndDo('Označiti ovaj račun kao plaćen? Ovo će dodati rashod u transakcije.', function(){
+        markBillPaid(btn.dataset.id);
+      });
+    }
+    else if(action === 'deleteBill'){
+      confirmAndDo('Obrisati ovaj račun?', function(){
+        state.bills = state.bills.filter(function(b){ return b.id!==btn.dataset.id; });
+        saveState(); render(); toast('Račun obrisan.');
+      });
+    }
+    else if(action === 'exportCsv'){ exportCSV(); }
+    else if(action === 'exportJson'){ exportJSON(); }
+    else if(action === 'deleteCategory'){
+      confirmAndDo('Obrisati ovu kategoriju?', function(){
+        var t = btn.dataset.type;
+        state.categories[t] = state.categories[t].filter(function(c){ return c!==btn.dataset.cat; });
+        saveState(); render(); toast('Kategorija obrisana.');
+      });
+    }
+    else if(action === 'resetAll'){
+      confirmAndDo('Ovo trajno briše SVE podatke (transakcije, budžete, ciljeve, račune). Da li si siguran/na?', function(){
+        state = defaultState();
+        saveState(); render(); toast('Svi podaci su obrisani.');
+      });
+    }
+    else if(action === 'cancelConfirm'){ closeModal(); }
+  }
+
+  function init(){
+    var app = document.getElementById('app');
+    app.addEventListener('click', onRootClick);
+    app.addEventListener('change', function(e){
+      var el = e.target.closest('[data-action]');
+      if(el){
+        if(el.dataset.action === 'filterType'){ ui.txFilter.type = el.value; render(); return; }
+        if(el.dataset.action === 'filterCurrency'){ ui.txFilter.currency = el.value; render(); return; }
+      }
+      if(e.target.id === 'importFileInput'){
+        var file = e.target.files[0];
+        if(file) handleImportFile(file);
+        e.target.value = '';
+      }
+    });
+    app.addEventListener('input', function(e){
+      var el = e.target.closest('[data-action="filterSearch"]');
+      if(el){ ui.txFilter.q = el.value; render(); }
+    });
+    document.getElementById('fabBtn').addEventListener('click', function(){ openTxForm(null); });
+    document.getElementById('modalCloseBtn').addEventListener('click', closeModal);
+    document.getElementById('modalOverlay').addEventListener('click', function(e){
+      if(e.target.id === 'modalOverlay') closeModal();
+    });
+    document.addEventListener('keydown', function(e){
+      if(e.key === 'Escape') closeModal();
+    });
+    render();
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>
